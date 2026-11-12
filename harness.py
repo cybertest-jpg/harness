@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 MODEL = "grok-4.7"
 BASE_URL = "https://api.x.ai/v1"  # API x.ai совместимо с форматом OpenAI
 MAX_STEPS = 20  # предохранитель: агент не может крутиться бесконечно
@@ -33,36 +35,11 @@ SYSTEM_PROMPT = f"""Ты — агент, работающий в папке {WOR
 
 
 # ─── 1. ИНСТРУМЕНТЫ ──────────────────────────────────────────────────────────
-# Модель не видит наш код. Она видит только это описание: имя, назначение
-# и JSON-схему аргументов. По описанию она решает, что и когда вызвать.
-
-def tool(name: str, description: str, **params: str) -> dict:
-    """Собирает описание инструмента в формате x.ai / OpenAI. Все аргументы — обязательные строки."""
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "description": description,
-            "parameters": {
-                "type": "object",
-                "properties": {key: {"type": "string", "description": hint} for key, hint in params.items()},
-                "required": list(params),
-            },
-        },
-    }
-
-
-TOOLS = [
-    tool("list_dir", "Показать файлы и папки в каталоге рабочей папки.", path="Относительный путь, '.' — корень"),
-    tool("read_file", "Прочитать текстовый файл целиком.", path="Относительный путь к файлу"),
-    tool("write_file", "Создать или перезаписать текстовый файл.", path="Относительный путь к файлу", content="Новое содержимое файла"),
-    tool("run_shell", "Выполнить shell-команду в рабочей папке. Пользователь подтверждает каждый запуск.", command="Команда"),
-]
-
-
-# ─── 2. ИСПОЛНИТЕЛЬ ──────────────────────────────────────────────────────────
-# Здесь «намерение» модели превращается в действие. Это же и граница
-# безопасности: модель может попросить что угодно, а что разрешить — решаем мы.
+# Каждый инструмент — класс Pydantic. Из одного класса получаются сразу три вещи:
+#   • описание для модели  — docstring класса и description полей;
+#   • JSON-схема аргументов — её строит Pydantic (model_json_schema);
+#   • проверка аргументов  — она же, когда модель присылает вызов.
+# Поэтому схема, которую видит модель, и проверка в коде не могут разойтись.
 
 def safe_path(relative: str) -> Path:
     """Не выпускаем агента за пределы песочницы (никаких ../../etc/passwd)."""
@@ -72,38 +49,96 @@ def safe_path(relative: str) -> Path:
     return path
 
 
-def list_dir(path: str) -> str:
-    entries = sorted(safe_path(path).iterdir())
-    return "\n".join(e.name + ("/" if e.is_dir() else "") for e in entries) or "(пусто)"
+class Tool(BaseModel):
+    """Общий предок инструментов: поля — это аргументы, run() — само действие."""
+
+    model_config = ConfigDict(extra="forbid")  # незнакомые аргументы — ошибка, а не молчаливый пропуск
+
+    def run(self) -> str:
+        raise NotImplementedError
 
 
-def read_file(path: str) -> str:
-    return safe_path(path).read_text(encoding="utf-8")
+class ListDir(Tool):
+    """Показать файлы и папки в каталоге рабочей папки."""
+
+    path: str = Field(description="Относительный путь, '.' — корень")
+
+    def run(self) -> str:
+        entries = sorted(safe_path(self.path).iterdir())
+        return "\n".join(e.name + ("/" if e.is_dir() else "") for e in entries) or "(пусто)"
 
 
-def write_file(path: str, content: str) -> str:
-    target = safe_path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return f"записано {len(content)} символов в {path}"
+class ReadFile(Tool):
+    """Прочитать текстовый файл целиком."""
+
+    path: str = Field(description="Относительный путь к файлу")
+
+    def run(self) -> str:
+        return safe_path(self.path).read_text(encoding="utf-8")
 
 
-def run_shell(command: str) -> str:
-    # Shell — самый опасный инструмент, поэтому человек подтверждает каждый запуск.
-    if input(f"    разрешить команду `{command}`? [y/N] ").strip().lower() != "y":
-        return "Пользователь отклонил запуск команды."
-    done = subprocess.run(command, shell=True, cwd=WORKSPACE, capture_output=True, text=True, timeout=60)
-    return f"код выхода: {done.returncode}\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}"
+class WriteFile(Tool):
+    """Создать или перезаписать текстовый файл."""
+
+    path: str = Field(description="Относительный путь к файлу")
+    content: str = Field(description="Новое содержимое файла")
+
+    def run(self) -> str:
+        target = safe_path(self.path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.content, encoding="utf-8")
+        return f"записано {len(self.content)} символов в {self.path}"
 
 
-HANDLERS = {"list_dir": list_dir, "read_file": read_file, "write_file": write_file, "run_shell": run_shell}
+class RunShell(Tool):
+    """Выполнить shell-команду в рабочей папке. Пользователь подтверждает каждый запуск."""
 
+    command: str = Field(description="Команда", min_length=1)
+    timeout: int = Field(default=60, ge=1, le=300, description="Лимит времени в секундах")
+
+    def run(self) -> str:
+        # Shell — самый опасный инструмент, поэтому человек подтверждает каждый запуск.
+        if input(f"    разрешить команду `{self.command}`? [y/N] ").strip().lower() != "y":
+            return "Пользователь отклонил запуск команды."
+        done = subprocess.run(
+            self.command, shell=True, cwd=WORKSPACE, capture_output=True, text=True, timeout=self.timeout
+        )
+        return f"код выхода: {done.returncode}\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}"
+
+
+# Имя, под которым инструмент известен модели → его класс.
+REGISTRY: dict[str, type[Tool]] = {
+    "list_dir": ListDir,
+    "read_file": ReadFile,
+    "write_file": WriteFile,
+    "run_shell": RunShell,
+}
+
+# То, что уходит модели в каждом запросе (формат x.ai / OpenAI). Модель не видит наш код —
+# только имя, описание и схему. По ним она решает, что и когда вызвать.
+TOOLS = [
+    {"type": "function", "function": {"name": name, "description": cls.__doc__, "parameters": cls.model_json_schema()}}
+    for name, cls in REGISTRY.items()
+]
+
+
+# ─── 2. ИСПОЛНИТЕЛЬ ──────────────────────────────────────────────────────────
+# Здесь «намерение» модели превращается в действие. Это же и граница
+# безопасности: модель может попросить что угодно, а что разрешить — решаем мы.
 
 def execute_tool(name: str, raw_args: str) -> str:
     """Аргументы приходят от модели JSON-строкой. Ошибка не роняет харнесс:
     она уходит модели обычным текстом, и модель сама решает, как её обойти."""
+    if name not in REGISTRY:
+        return f"ОШИБКА: нет инструмента {name!r}. Доступны: {', '.join(REGISTRY)}"
     try:
-        return HANDLERS[name](**json.loads(raw_args))
+        call = REGISTRY[name].model_validate_json(raw_args)  # разбор JSON + проверка типов и ограничений
+    except ValidationError as error:
+        # Точно говорим модели, какое поле и чем не устроило, — так ей проще исправиться.
+        problems = [f"{'.'.join(map(str, e['loc'])) or 'аргументы'}: {e['msg']}" for e in error.errors()]
+        return "ОШИБКА в аргументах:\n" + "\n".join(problems)
+    try:
+        return call.run()
     except Exception as error:
         return f"ОШИБКА {type(error).__name__}: {error}"
 
@@ -196,7 +231,7 @@ def main() -> None:
         run_turn(ScriptedClient(), [system, {"role": "user", "content": "Создай файл hello.txt и проверь его."}])
         return
 
-    import openai  # импорт здесь, чтобы --demo работал без установленного SDK
+    import openai
 
     load_env_file()
     if not os.environ.get("XAI_API_KEY"):
