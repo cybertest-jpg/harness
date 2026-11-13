@@ -6,3 +6,5 @@ logs/
 memory.md
 sessions/
 permissions.json
+hooks.json
+mcp.json

@@ -9,7 +9,10 @@
 import contextlib
 import io
 import json
+import shutil
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,12 +42,23 @@ class HarnessTest(unittest.TestCase):
             "JOURNAL": h.Journal(),
             "METER": h.Meter(),
             "PERMISSIONS": dict(h.DEFAULT_PERMISSIONS),
+            "HOOKS_FILE": root / "hooks.json",
+            "MCP_FILE": root / "mcp.json",
+            "SKILLS_DIR": root / "skills",
+            "NONINTERACTIVE": False,
+            "SANDBOX": False,
+            "TOOLS": list(h.TOOLS),  # копии: MCP дописывает сюда свои инструменты
+            "SUBAGENT_TOOLS": list(h.SUBAGENT_TOOLS),
         }
         for name, value in patches.items():
             patcher = mock.patch.object(h, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
         self.addCleanup(h.JOURNAL.close)
+        self.addCleanup(self.stop_processes)
+        self.addCleanup(h.close_mcp)
+        for state in (h.CHECKPOINTS, h.HOOKS, h.MCP_TOOLS, h.MCP_SERVERS, h.PROCESSES):
+            state.clear()
         h.TODO.clear()
         h.ALWAYS.clear()
         h.CANCEL.clear()
@@ -55,6 +69,11 @@ class HarnessTest(unittest.TestCase):
         redirect = contextlib.redirect_stdout(self.output)
         redirect.__enter__()
         self.addCleanup(redirect.__exit__, None, None, None)
+
+    def stop_processes(self):
+        h.stop_all_processes()
+        for entry in h.PROCESSES.values():  # дожидаемся и тех, что завершились сами
+            entry["proc"].wait(timeout=5)
 
     def run_script(self, script, tools=h.TOOLS, user="задача"):
         client = ScriptedClient(script)
@@ -332,7 +351,8 @@ class ContextTest(HarnessTest):
     def test_cancel_flag_stops_agent_before_next_request(self):
         h.CANCEL.set()
         result, _, client = self.run_script([("не должно дойти", [])])
-        self.assertIn("прервана", result)
+        self.assertIn("прервано", result)
+        self.assertTrue(result.startswith(h.STOPPED))
         self.assertEqual(client.requests, [])
 
 
@@ -440,6 +460,305 @@ class SubagentTest(HarnessTest):
     def test_too_many_tasks_rejected(self):
         tasks = [f"задача {i}" for i in range(h.MAX_PARALLEL + 1)]
         self.assertIn("ОШИБКА в аргументах", h.execute_tool("delegate", json.dumps({"tasks": tasks}), ALL))
+
+
+class UndoTest(HarnessTest):
+    def tool(self, name, **args):
+        return h.execute_tool(name, json.dumps(args), ALL)
+
+    def test_undo_restores_edited_and_removes_created(self):
+        old = self.workspace / "old.txt"
+        old.write_text("исходный")
+        h.CHECKPOINTS.append({})  # так начинается каждый ход
+        self.tool("edit_file", path="old.txt", old_text="исходный", new_text="первая правка")
+        self.tool("edit_file", path="old.txt", old_text="первая правка", new_text="вторая правка")
+        self.tool("write_file", path="dir/new.txt", content="новый")
+        self.assertEqual(h.undo(), ["dir/new.txt", "old.txt"])
+        self.assertEqual(old.read_text(), "исходный")  # к состоянию до хода, а не до последней правки
+        self.assertFalse((self.workspace / "dir/new.txt").exists())
+
+    def test_undo_touches_only_last_turn(self):
+        file = self.workspace / "a.txt"
+        file.write_text("v0")
+        for version in ("v1", "v2"):
+            h.CHECKPOINTS.append({})
+            self.tool("write_file", path="a.txt", content=version)
+        h.CHECKPOINTS.append({})  # ход без правок пропускается
+        h.undo()
+        self.assertEqual(file.read_text(), "v1")
+        h.undo()
+        self.assertEqual(file.read_text(), "v0")
+        self.assertEqual(h.undo(), [])
+
+
+class DiffPreviewTest(HarnessTest):
+    def test_permission_question_shows_diff(self):
+        (self.workspace / "a.py").write_text("x = 1\ny = 2\n")
+        h.PERMISSIONS["edit_file"] = "ask"
+        with self.answer("n"):
+            output = h.execute_tool("edit_file", json.dumps({"path": "a.py", "old_text": "y = 2", "new_text": "y = 3"}), ALL)
+        self.assertIn("отклонил", output)
+        shown = self.output.getvalue()
+        self.assertIn("-y = 2", shown)
+        self.assertIn("+y = 3", shown)
+        self.assertEqual((self.workspace / "a.py").read_text(), "x = 1\ny = 2\n")  # отказ — файл не тронут
+
+    def test_new_file_is_shown_as_additions(self):
+        self.assertIn("+привет", h.WriteFile(path="new.txt", content="привет").preview())
+
+    def test_long_diff_is_clipped(self):
+        preview = h.WriteFile(path="big.txt", content="\n".join(map(str, range(500)))).preview()
+        self.assertIn("и ещё", preview)
+        self.assertLessEqual(len(preview.splitlines()), h.DIFF_LINES_LIMIT + 1)
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("sandbox-exec"), "песочница есть только на macOS")
+class SandboxTest(HarnessTest):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(h, "SANDBOX", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        h.PERMISSIONS["run_shell"] = "allow"
+
+    def shell(self, command):
+        return h.execute_tool("run_shell", json.dumps({"command": command}), ALL)
+
+    def test_write_inside_workspace_is_allowed(self):
+        self.assertIn("код выхода: 0", self.shell("echo ok > inside.txt"))
+        self.assertEqual((self.workspace / "inside.txt").read_text().strip(), "ok")
+
+    def test_write_outside_workspace_is_blocked(self):
+        outside = Path.home() / "harness_sandbox_probe.txt"
+        self.addCleanup(outside.unlink, missing_ok=True)
+        self.assertNotIn("код выхода: 0", self.shell(f"echo bad > '{outside}'"))
+        self.assertFalse(outside.exists())
+
+    def test_network_is_blocked(self):
+        output = self.shell("curl -s -m 5 -o /dev/null https://example.com")
+        self.assertNotIn("код выхода: 0", output)
+
+    def test_secrets_are_unreadable(self):
+        output = self.shell(f"cat '{Path(h.__file__).parent / '.env'}'")
+        self.assertNotIn("XAI_API_KEY", output)
+
+
+class HooksTest(HarnessTest):
+    def test_before_hook_blocks_call(self):
+        h.HOOKS.append({"when": "before", "tool": "write_file", "command": "echo 'запись запрещена правилом'; exit 1"})
+        output = h.execute_tool("write_file", '{"path": "a.txt", "content": "x"}', ALL)
+        self.assertIn("ЗАБЛОКИРОВАНО хуком", output)
+        self.assertIn("запись запрещена правилом", output)
+        self.assertFalse((self.workspace / "a.txt").exists())
+
+    def test_after_hook_output_goes_to_model(self):
+        h.HOOKS.append({"when": "after", "tool": "*", "command": "echo 'линтер: замечаний нет'"})
+        output = h.execute_tool("write_file", '{"path": "a.txt", "content": "x"}', ALL)
+        self.assertIn("записано 1 символов", output)
+        self.assertIn("[хук пользователя] линтер: замечаний нет", output)
+
+    def test_hook_receives_call_as_json(self):
+        h.HOOKS.append({"when": "after", "tool": "write_file", "command": "cat > payload.json"})
+        h.execute_tool("write_file", '{"path": "a.txt", "content": "текст"}', ALL)
+        payload = json.loads((self.workspace / "payload.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["tool"], "write_file")
+        self.assertEqual(payload["arguments"], {"path": "a.txt", "content": "текст"})
+        self.assertIn("записано", payload["output"])
+
+    def test_hook_for_other_tool_is_skipped(self):
+        h.HOOKS.append({"when": "before", "tool": "run_shell", "command": "exit 1"})
+        self.assertIn("записано", h.execute_tool("write_file", '{"path": "a.txt", "content": "x"}', ALL))
+
+    def test_bad_hooks_file_is_reported(self):
+        h.HOOKS_FILE.write_text('[{"when": "иногда", "tool": "x", "command": "y"}]')
+        with self.assertRaises(SystemExit):
+            h.load_hooks()
+
+
+class SkillsTest(HarnessTest):
+    def setUp(self):
+        super().setUp()
+        h.SKILLS_DIR.mkdir()
+        (h.SKILLS_DIR / "deploy.md").write_text("# Выкладка: как выпускать версию\n\nШаг 1. Прогони тесты.\n", encoding="utf-8")
+
+    def test_prompt_lists_only_name_and_description(self):
+        prompt = h.system_prompt()
+        self.assertIn("- deploy: Выкладка: как выпускать версию", prompt)
+        self.assertNotIn("Прогони тесты", prompt)  # полный текст в промпт не попадает
+
+    def test_use_skill_returns_full_text(self):
+        self.assertIn("Шаг 1. Прогони тесты.", h.execute_tool("use_skill", '{"name": "deploy"}', ALL))
+
+    def test_unknown_skill(self):
+        self.assertIn("Доступны: deploy", h.execute_tool("use_skill", '{"name": "нет"}', ALL))
+
+    def test_bundled_skills_are_readable(self):
+        with mock.patch.object(h, "SKILLS_DIR", Path(h.__file__).parent / "skills"):
+            found = h.skills()
+        self.assertIn("code-review", found)
+        self.assertTrue(all(description for description, _ in found.values()))
+
+
+class McpTest(HarnessTest):
+    def setUp(self):
+        super().setUp()
+        server = Path(h.__file__).parent / "examples" / "mcp_demo_server.py"
+        h.MCP_FILE.write_text(json.dumps({"servers": {"demo": {"command": sys.executable, "args": [str(server)]}}}))
+        h.load_mcp()
+
+    def test_server_tools_are_registered(self):
+        self.assertEqual(sorted(h.MCP_TOOLS), ["mcp__demo__current_time", "mcp__demo__word_count"])
+        schema = next(tool["function"] for tool in h.TOOLS if tool["function"]["name"] == "mcp__demo__word_count")
+        self.assertEqual(schema["parameters"]["required"], ["text"])  # схема взята у сервера как есть
+        self.assertIn("mcp__demo__word_count", {tool["function"]["name"] for tool in h.SUBAGENT_TOOLS})
+
+    def test_call_goes_through_server(self):
+        allowed = {tool["function"]["name"] for tool in h.TOOLS}
+        with self.answer("y"):
+            output = h.execute_tool("mcp__demo__word_count", '{"text": "раз два три"}', allowed)
+        self.assertEqual(output, "слов: 3, строк: 1, символов: 11")
+
+    def test_foreign_tools_ask_permission_by_default(self):
+        allowed = {tool["function"]["name"] for tool in h.TOOLS}
+        with self.answer("n") as prompt:
+            self.assertIn("отклонил", h.execute_tool("mcp__demo__current_time", "{}", allowed))
+        prompt.assert_called_once()
+
+    def test_server_error_becomes_tool_result(self):
+        h.PERMISSIONS["mcp__demo__word_count"] = "allow"
+        allowed = {tool["function"]["name"] for tool in h.TOOLS}
+        output = h.execute_tool("mcp__demo__word_count", "{}", allowed)  # нет обязательного text
+        self.assertIn("ОШИБКА", output)
+
+    def test_model_can_call_mcp_tool_in_loop(self):
+        h.PERMISSIONS["mcp__demo__word_count"] = "allow"
+        _, context, _ = self.run_script(
+            [("", [scripted_call(1, "mcp__demo__word_count", text="один два")]), ("ок", [])], tools=h.TOOLS
+        )
+        self.assertEqual(context.messages[3]["content"], "слов: 2, строк: 1, символов: 8")
+
+    def test_broken_server_does_not_stop_startup(self):
+        h.MCP_FILE.write_text(json.dumps({"servers": {"нет": {"command": "/no/such/program"}}}))
+        h.load_mcp()  # не должно упасть
+        self.assertEqual(len(h.MCP_SERVERS), 1)  # остался только рабочий сервер из setUp
+
+
+class ProcessTest(HarnessTest):
+    def setUp(self):
+        super().setUp()
+        h.PERMISSIONS["process_start"] = "allow"
+
+    def tool(self, name, **args):
+        return h.execute_tool(name, json.dumps(args), ALL)
+
+    def test_start_read_stop(self):
+        started = self.tool("process_start", command="echo готов; sleep 30")
+        self.assertIn("процесс 1 запущен", started)
+        self.assertIn("состояние: работает", started)
+        self.assertIn("готов", started)
+        self.assertIn("(пусто)", self.tool("process_output", process=1))  # вывод отдаётся один раз
+        self.assertIn("завершился", self.tool("process_stop", process=1))
+
+    def test_crash_is_visible_at_start(self):
+        self.assertIn("завершился с кодом 3", self.tool("process_start", command="echo упал; exit 3"))
+
+    def test_output_arrives_later(self):
+        self.tool("process_start", command="sleep 1.5; echo позже; sleep 30")
+        time.sleep(1.2)
+        self.assertIn("позже", self.tool("process_output", process=1))
+
+    def test_unknown_process(self):
+        self.assertIn("нет процесса 9", self.tool("process_output", process=9))
+
+
+class ModelChoiceTest(HarnessTest):
+    def test_main_agent_uses_main_model(self):
+        _, _, client = self.run_script([("ок", [])])
+        self.assertEqual(client.requests[0]["model"], h.MODEL)
+        self.assertEqual(client.requests[0]["reasoning_effort"], h.EFFORT)
+
+    def test_subagent_uses_cheaper_model(self):
+        seen = []
+
+        def create(**request):
+            seen.append((request["model"], request["reasoning_effort"]))
+            return ScriptedClient([("итог", [])])._stream()
+
+        h.CLIENT = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        with mock.patch.object(h, "browser", return_value=mock.Mock()):
+            h.execute_tool("delegate", '{"tasks": ["задача"]}', ALL)
+        self.assertEqual(seen, [(h.SUBAGENT_MODEL, h.SUBAGENT_EFFORT)])
+
+    def test_compaction_uses_utility_model(self):
+        client = ScriptedClient([])
+        context = h.Context([{"role": "system", "content": "s"}] + [{"role": "user", "content": str(i)} for i in range(12)])
+        h.compact(client, context)
+        self.assertEqual(client.requests[0]["model"], h.UTILITY_MODEL)
+
+
+class NonInteractiveTest(HarnessTest):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(h, "NONINTERACTIVE", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_once(self, script, *flags):
+        h.CLIENT = ScriptedClient(script)
+        context = h.Context([{"role": "system", "content": "s"}])
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "argv", ["harness.py", *flags]), contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = h.run_once(context, "задача")
+        return code, stdout.getvalue()
+
+    def test_ask_rule_is_refused_without_prompting(self):
+        with self.answer("y") as prompt:
+            output = h.execute_tool("run_shell", '{"command": "echo hi"}', ALL)
+        self.assertIn("ОТКАЗ", output)
+        prompt.assert_not_called()
+
+    def test_allowed_tool_runs(self):
+        h.PERMISSIONS["run_shell"] = "allow"  # так действует --allow run_shell
+        self.assertIn("hi", h.execute_tool("run_shell", '{"command": "echo hi"}', ALL))
+
+    def test_stdout_has_only_the_result(self):
+        code, out = self.run_once([("", [scripted_call(1, "list_dir", path=".")]), ("Готово.", [])])
+        self.assertEqual((code, out.strip()), (0, "Готово."))  # ход агента в stdout не попал
+
+    def test_json_output(self):
+        code, out = self.run_once([("Сделано.", [])], "--json")
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["result"].strip(), "Сделано.")
+        self.assertEqual(set(data), {"ok", "result", "error", "requests", "input_tokens", "output_tokens", "cost_usd", "session_file"})
+
+    def test_step_limit_gives_nonzero_exit(self):
+        endless = [("", [scripted_call(i, "list_dir", path=".")]) for i in range(h.MAX_STEPS)]
+        code, out = self.run_once(endless, "--json")
+        self.assertEqual(code, 1)
+        self.assertFalse(json.loads(out)["ok"])
+
+
+class WebSearchTest(HarnessTest):
+    def test_answer_with_sources_and_cost(self):
+        note = lambda url: SimpleNamespace(url=url)
+        message = SimpleNamespace(content=[SimpleNamespace(annotations=[note("https://a.example"), note("https://a.example"), note("https://b.example")])])
+        response = SimpleNamespace(
+            output_text="Ответ.", output=[SimpleNamespace(content=None), message],
+            usage=SimpleNamespace(input_tokens=1000, output_tokens=20, cost_in_usd_ticks=50_000_000),
+        )
+        create = mock.Mock(return_value=response)
+        h.CLIENT = SimpleNamespace(responses=SimpleNamespace(create=create))
+        output = h.execute_tool("web_search", '{"query": "версия Python"}', ALL)
+        self.assertEqual(output, "Ответ.\n\nИсточники:\nhttps://a.example\nhttps://b.example")  # без повторов
+        self.assertEqual(create.call_args.kwargs["model"], h.UTILITY_MODEL)
+        self.assertEqual(h.METER.totals(), (1, 1000, 20, 0.005))  # поиск входит в расход сессии
+
+    def test_unavailable_without_real_client(self):
+        h.CLIENT = ScriptedClient([])
+        self.assertIn("поиск доступен только", h.execute_tool("web_search", '{"query": "x"}', ALL))
 
 
 if __name__ == "__main__":

@@ -11,7 +11,8 @@
 
 Поверх этого ядра добавлены: журнал сессии, потоковая выдача ответа, память
 между запусками, сжатие контекста, параллельные субагенты, политика разрешений,
-режим плана, список задач, зрение, продолжение сессии и учёт стоимости.
+режим плана, список задач, зрение, продолжение сессии, учёт стоимости, откат правок,
+песочница для команд, фоновые процессы, поиск в интернете, навыки, хуки и MCP.
 
 Запуск:
     python harness.py            # живая модель x.ai (ключ XAI_API_KEY берётся из файла .env)
@@ -20,16 +21,25 @@
     python harness.py --dir ПУТЬ # работать в указанной папке проекта, а не в workspace/
     python harness.py --resume   # продолжить прошлый разговор
     python harness.py --budget 1 # остановить агента, когда сессия израсходует 1 доллар
+    python harness.py --sandbox  # команды агента — в песочнице macOS: без сети, запись только в рабочую папку
+    python harness.py --model grok-4.3 --effort low   # другая модель и глубина рассуждений
+    python harness.py -p "задача" --json --allow run_python   # одна задача без диалога, итог в JSON
 """
 
 import atexit
 import base64
+import contextlib
+import difflib
 import json
 import os
+import queue
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -39,7 +49,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-MODEL = "grok-4.7"
+MODEL = "grok-4.7"  # основной агент; меняется параметром --model
+EFFORT = "high"  # глубина рассуждений основного агента: low, medium, high, xhigh; меняется параметром --effort
+# ВЫБОР МОДЕЛИ ПО ЗАДАЧЕ: субагенту, читающему страницу, сжатию и поиску сильная модель не нужна.
+SUBAGENT_MODEL, SUBAGENT_EFFORT = "grok-4.3", "low"  # втрое дешевле основной
+UTILITY_MODEL, UTILITY_EFFORT = "grok-4.3", "low"  # сжатие контекста и поиск в интернете
 BASE_URL = "https://api.x.ai/v1"  # API x.ai совместимо с форматом OpenAI
 MAX_STEPS = 20  # предохранитель: агент не может крутиться бесконечно
 HEADLESS = "--headless" in sys.argv  # по умолчанию окно браузера видно: можно смотреть, что делает агент
@@ -56,6 +70,13 @@ PERMISSIONS_FILE = Path(__file__).parent / "permissions.json"  # необяза�
 INSTRUCTIONS_NAME = "AGENT.md"  # файл с правилами проекта в рабочей папке
 INSTRUCTIONS_LIMIT = 8000  # сколько символов из него попадает в промпт
 MAX_PARALLEL = 4  # сколько субагентов может работать одновременно
+HOOKS_FILE = Path(__file__).parent / "hooks.json"  # необязательные хуки пользователя
+MCP_FILE = Path(__file__).parent / "mcp.json"  # необязательный список MCP-серверов
+MCP_TIMEOUT = 30  # сколько секунд ждать ответа MCP-сервера
+SKILLS_DIR = Path(__file__).parent / "skills"  # навыки: по файлу .md на каждый
+DIFF_LINES_LIMIT = 60  # сколько строк правки показывать человеку перед подтверждением
+SANDBOX = "--sandbox" in sys.argv  # запускать команды агента в системной песочнице macOS
+STOPPED = "Работа остановлена"  # с этих слов начинается итог хода, который харнесс оборвал сам
 
 
 def option(name: str) -> str | None:
@@ -70,6 +91,8 @@ def workspace_from_args() -> Path:
     return Path(__file__).parent / "workspace"
 
 
+MODEL = option("--model") or MODEL
+EFFORT = option("--effort") or EFFORT
 WORKSPACE = workspace_from_args()  # песочница: файловые инструменты работают только здесь
 LOGS_DIR = Path(__file__).parent / "logs"  # журналы сессий, по файлу на запуск
 MEMORY_FILE = Path(__file__).parent / "memory.md"  # заметки агента, переживающие перезапуск
@@ -85,6 +108,8 @@ BASE_PROMPT = f"""Ты — агент, работающий в папке {WORKS
 Код: нужное место ищи через search и find_files, читай нужный диапазон строк, а не файл целиком.
 Существующие файлы правь через edit_file, а не перезаписью. После правки запусти код или тесты и убедись, что работает.
 Если текста страницы мало (картинки, графики, вёрстка), посмотри на неё через browser_screenshot.
+Если не знаешь адрес или нужны свежие сведения, начни с web_search.
+Долгие команды, которые не завершаются сами (серверы), запускай через process_start, а не run_shell.
 Память: инструментом remember сохраняй то, что пригодится в будущих сессиях.
 Список задач: для работы из трёх и более шагов веди его через todo и отмечай выполненное.
 Субагенты: объёмные самостоятельные подзадачи (например, изучить несколько страниц) поручай через delegate;
@@ -120,6 +145,9 @@ def system_prompt() -> str:
     notes = MEMORY_FILE.read_text(encoding="utf-8").strip() if MEMORY_FILE.exists() else ""
     if notes:
         prompt += f"\n\nТвои заметки из прошлых сессий:\n{notes}"
+    listing = "\n".join(f"- {name}: {description}" for name, (description, _) in skills().items())
+    if listing:  # НАВЫКИ: в промпте только названия и описания, полный текст — по запросу
+        prompt += f"\n\nНавыки — готовые инструкции; прежде чем браться за такую работу, прочитай навык через use_skill:\n{listing}"
     return prompt
 
 
@@ -128,6 +156,7 @@ def system_prompt() -> str:
 # потоках, поэтому общее состояние защищено замком, а браузер у каждого потока свой.
 
 IO_LOCK = threading.RLock()  # один замок на терминал и журнал: строки разных агентов не перемешиваются
+NONINTERACTIVE = False  # True в режиме -p: человека рядом нет, спросить разрешение не у кого
 CANCEL = threading.Event()  # поднят, когда пользователь нажал Ctrl+C: агенты останавливаются перед следующим шагом
 LOCAL = threading.local()  # данные своего потока: браузер и очередь скриншотов
 TODO: list[dict] = []  # список задач основного агента
@@ -171,8 +200,9 @@ class Meter:
             return
         with self._lock:  # субагенты добавляют расход из своих потоков
             self.requests += 1
-            self.prompt += usage.prompt_tokens or 0
-            self.completion += usage.completion_tokens or 0
+            # В обычных ответах API поля называются prompt/completion, в ответах поиска — input/output.
+            self.prompt += getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None) or 0
+            self.completion += getattr(usage, "completion_tokens", None) or getattr(usage, "output_tokens", None) or 0
             self.cost += (getattr(usage, "cost_in_usd_ticks", None) or 0) / 1e10
 
     def totals(self) -> tuple:
@@ -248,8 +278,59 @@ class Tool(BaseModel):
         raise NotImplementedError
 
     def summary(self) -> str:
-        """Как показать вызов человеку, когда харнесс спрашивает разрешение."""
+        """Как коротко показать вызов человеку, когда харнесс спрашивает разрешение."""
         return json.dumps(self.model_dump(), ensure_ascii=False)[:300]
+
+    def preview(self) -> str:
+        """Подробный показ перед подтверждением. У инструментов правки это diff."""
+        return self.summary()
+
+
+# ─── ОТКАТ ПРАВОК ────────────────────────────────────────────────────────────
+# Перед тем как инструмент изменит файл, харнесс запоминает его прежнее содержимое.
+# Команда /undo возвращает всё, что агент и субагенты изменили за последний ход,
+# и удаляет созданные ими файлы. Работает без git и в любой папке.
+
+CHECKPOINTS: list[dict[Path, bytes | None]] = []  # по словарю на ход: файл → содержимое до правки
+
+
+def checkpoint(path: Path) -> None:
+    with IO_LOCK:
+        if not CHECKPOINTS:
+            CHECKPOINTS.append({})
+        # setdefault: запоминаем состояние до первой правки за ход, а не до последней
+        CHECKPOINTS[-1].setdefault(path, path.read_bytes() if path.is_file() else None)
+
+
+def undo() -> list[str]:
+    """Откатывает последний ход, в котором были правки. Возвращает список затронутых файлов."""
+    while CHECKPOINTS:
+        saved = CHECKPOINTS.pop()
+        for path, data in saved.items():
+            if data is None:  # файла до хода не было — удаляем
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+        if saved:
+            return sorted(str(path.relative_to(WORKSPACE.resolve())) for path in saved)
+    return []
+
+
+def diff_text(path: str, old: str, new: str) -> str:
+    """ПРОСМОТР ПРАВКИ: отличия в привычном виде, зелёным добавленное, красным удалённое."""
+    lines = list(difflib.unified_diff(old.splitlines(), new.splitlines(), f"{path} (было)", f"{path} (станет)", lineterm="", n=2))
+    if not lines:
+        return "    (содержимое не меняется)"
+    extra = len(lines) - DIFF_LINES_LIMIT
+    color = sys.stdout.isatty()
+
+    def paint(line: str) -> str:
+        code = "32" if line.startswith("+") else "31" if line.startswith("-") else ""
+        return f"    \033[{code}m{line}\033[0m" if color and code else f"    {line}"
+
+    shown = [paint(line) for line in lines[:DIFF_LINES_LIMIT]]
+    return "\n".join(shown + ([f"    … и ещё {extra} строк"] if extra > 0 else []))
 
 
 class ListDir(Tool):
@@ -290,8 +371,13 @@ class WriteFile(Tool):
     path: str = Field(description="Относительный путь к файлу")
     content: str = Field(description="Новое содержимое файла")
 
+    def preview(self) -> str:
+        target = safe_path(self.path)
+        return diff_text(self.path, target.read_text(encoding="utf-8") if target.is_file() else "", self.content)
+
     def run(self) -> str:
         target = safe_path(self.path)
+        checkpoint(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(self.content, encoding="utf-8")
         return f"записано {len(self.content)} символов в {self.path}"
@@ -299,6 +385,33 @@ class WriteFile(Tool):
 
 def report(done: subprocess.CompletedProcess) -> str:
     return f"код выхода: {done.returncode}\nstdout:\n{done.stdout}\nstderr:\n{done.stderr}"
+
+
+def sandbox_profile() -> str:
+    """ПЕСОЧНИЦА: правила для системной песочницы macOS (sandbox-exec).
+
+    Проверка путей в safe_path защищает только файловые инструменты, а запущенная команда
+    может делать что угодно. Песочница ограничивает уже сам процесс: сеть закрыта (кроме
+    localhost — чтобы работали локальные серверы), запись разрешена только в рабочую папку
+    и временные каталоги, чтение ключей и секретов запрещено.
+    """
+    home, here = Path.home(), Path(__file__).parent.resolve()
+    writable = [WORKSPACE.resolve(), "/private/tmp", "/private/var/folders", "/dev"]
+    secrets = [home / ".ssh", home / ".aws", home / ".gnupg", home / "Library/Keychains",
+               here / ".env", here / "logs", here / "sessions", here / "memory.md"]
+    paths = lambda items: " ".join(f'(subpath "{item}")' for item in items)
+    return f"""(version 1)
+(allow default)
+(deny network*)
+(allow network* (local ip "localhost:*") (remote ip "localhost:*"))
+(deny file-write*)
+(allow file-write* {paths(writable)})
+(deny file-read* {paths(secrets)})"""
+
+
+def sandboxed(command: list[str]) -> list[str]:
+    """Оборачивает команду в песочницу, если харнесс запущен с --sandbox."""
+    return ["sandbox-exec", "-p", sandbox_profile(), *command] if SANDBOX else command
 
 
 class RunShell(Tool):
@@ -313,7 +426,7 @@ class RunShell(Tool):
     def run(self) -> str:
         # Shell — самый опасный инструмент. Спрашивать ли человека, решает политика разрешений (см. permit).
         done = subprocess.run(
-            self.command, shell=True, cwd=WORKSPACE, capture_output=True, text=True, timeout=self.timeout
+            sandboxed(["/bin/sh", "-c", self.command]), cwd=WORKSPACE, capture_output=True, text=True, timeout=self.timeout
         )
         return report(done)
 
@@ -344,6 +457,10 @@ class EditFile(Tool):
     old_text: str = Field(min_length=1, description="Заменяемый фрагмент — без номеров строк и черты «│»")
     new_text: str = Field(description="Новый текст на его месте; пустая строка удаляет фрагмент")
 
+    def preview(self) -> str:
+        text = safe_path(self.path).read_text(encoding="utf-8")
+        return diff_text(self.path, text, text.replace(self.old_text, self.new_text, 1))
+
     def run(self) -> str:
         target = safe_path(self.path)
         text = target.read_text(encoding="utf-8")
@@ -355,6 +472,7 @@ class EditFile(Tool):
         if count > 1:
             raise ValueError(f"old_text встречается {count} раз — добавь соседние строки, чтобы он стал уникальным")
         line = text[: text.index(self.old_text)].count("\n") + 1
+        checkpoint(target)
         target.write_text(text.replace(self.old_text, self.new_text), encoding="utf-8")
         return f"изменено в {self.path}, начиная со строки {line}"
 
@@ -423,10 +541,10 @@ class RunPython(Tool):
         target = safe_path(self.path)
         if target.suffix != ".py" or not target.is_file():
             raise ValueError("нужен существующий файл с расширением .py")
-        # Сам скрипт песочницей не ограничен и может делать на машине что угодно,
+        # Без --sandbox скрипт ничем не ограничен и может делать на машине что угодно,
         # поэтому по умолчанию запуск требует разрешения человека (см. DEFAULT_PERMISSIONS).
         done = subprocess.run(
-            [sys.executable, str(target), *self.args], cwd=WORKSPACE, capture_output=True, text=True, timeout=self.timeout
+            sandboxed([sys.executable, str(target), *self.args]), cwd=WORKSPACE, capture_output=True, text=True, timeout=self.timeout
         )
         return report(done)
 
@@ -459,6 +577,7 @@ class GitRestore(Tool):
 
     def run(self) -> str:
         target = safe_path(self.path)
+        checkpoint(target)
         return git("restore", "--", str(target)) or f"{self.path} возвращён к последнему коммиту"
 
 
@@ -625,6 +744,295 @@ class BrowserScreenshot(Tool):
         return "скриншот сделан: изображение приложено следующим сообщением"
 
 
+# ─── ФОНОВЫЕ ПРОЦЕССЫ ────────────────────────────────────────────────────────
+# run_shell ждёт, пока команда завершится, поэтому веб-сервер через него не запустить:
+# он не завершается никогда. Фоновый процесс стартует и сразу возвращает управление,
+# а его вывод копится в харнессе, и агент читает его, когда нужно.
+
+PROCESSES: dict[int, dict] = {}
+
+
+def process_report(number: int) -> str:
+    """Состояние процесса и вывод, накопившийся с прошлого чтения."""
+    entry = PROCESSES[number]
+    fresh = "".join(entry["lines"][entry["seen"]:])
+    entry["seen"] = len(entry["lines"])
+    code = entry["proc"].poll()
+    status = "работает" if code is None else f"завершился с кодом {code}"
+    return f"состояние: {status}\nновый вывод:\n{fresh or '(пусто)'}"
+
+
+def stop_process(entry: dict) -> None:
+    proc = entry["proc"]
+    if proc.poll() is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGTERM)  # гасим всю группу: команда могла породить дочерние процессы
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=3)
+
+
+def stop_all_processes() -> None:
+    for entry in PROCESSES.values():
+        stop_process(entry)
+
+
+def find_process(number: int) -> dict:
+    if number not in PROCESSES:
+        raise ValueError(f"нет процесса {number}. Запущены: {sorted(PROCESSES) or 'ни одного'}")
+    return PROCESSES[number]
+
+
+class ProcessStart(Tool):
+    """Запустить долгую команду в фоне (веб-сервер, наблюдатель за файлами) и сразу вернуть управление.
+    Вывод читай через process_output, останавливай через process_stop."""
+
+    command: str = Field(min_length=1, description="Команда")
+
+    def summary(self) -> str:
+        return f"в фоне: `{self.command}`"
+
+    def run(self) -> str:
+        proc = subprocess.Popen(
+            sandboxed(["/bin/sh", "-c", self.command]), cwd=WORKSPACE, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+        with IO_LOCK:
+            number = len(PROCESSES) + 1
+            entry = PROCESSES[number] = {"proc": proc, "command": self.command, "lines": [], "seen": 0}
+
+        def pump() -> None:  # отдельный поток перекладывает вывод процесса в память харнесса
+            with proc.stdout:
+                for line in proc.stdout:
+                    entry["lines"].append(line)
+
+        threading.Thread(target=pump, daemon=True).start()
+        time.sleep(1)  # секунда на старт: если команда сразу упала, агент узнает об этом уже сейчас
+        return f"процесс {number} запущен\n{process_report(number)}"
+
+
+class ProcessOutput(Tool):
+    """Показать состояние фонового процесса и его вывод, появившийся с прошлого чтения."""
+
+    process: int = Field(ge=1, description="Номер процесса из process_start")
+
+    def run(self) -> str:
+        find_process(self.process)
+        return process_report(self.process)
+
+
+class ProcessStop(Tool):
+    """Остановить фоновый процесс."""
+
+    process: int = Field(ge=1, description="Номер процесса из process_start")
+
+    def run(self) -> str:
+        stop_process(find_process(self.process))
+        return process_report(self.process)
+
+
+# ─── ПОИСК В ИНТЕРНЕТЕ ───────────────────────────────────────────────────────
+
+class WebSearch(Tool):
+    """Найти информацию в интернете. Возвращает краткий ответ и ссылки на источники.
+    Чтобы прочитать источник целиком, открой его через browser_open."""
+
+    query: str = Field(min_length=1, description="Что нужно найти, обычным языком")
+
+    def run(self) -> str:
+        # Поиск выполняет сам провайдер: это отдельный запрос к API x.ai со встроенным
+        # инструментом web_search. Харнесс получает готовый ответ и ссылки.
+        if not hasattr(CLIENT, "responses"):
+            raise RuntimeError("поиск доступен только при работе с настоящей моделью")
+        response = CLIENT.responses.create(
+            model=UTILITY_MODEL,
+            tools=[{"type": "web_search"}],
+            input=f"Найди в интернете и ответь кратко, по существу, с конкретными фактами и датами: {self.query}",
+        )
+        METER.add(response.usage)
+        urls = []
+        for item in response.output:
+            for part in getattr(item, "content", None) or []:
+                for note in getattr(part, "annotations", None) or []:
+                    url = getattr(note, "url", None)
+                    if url and url not in urls:
+                        urls.append(url)
+        return response.output_text + ("\n\nИсточники:\n" + "\n".join(urls[:10]) if urls else "")
+
+
+# ─── НАВЫКИ ──────────────────────────────────────────────────────────────────
+# Навык — это файл с инструкцией «как делать такую-то работу». В системный промпт
+# попадают только названия и описания, а полный текст агент читает, когда навык
+# понадобился. Так инструкций может быть много, а контекст они почти не занимают.
+
+def skills() -> dict[str, tuple[str, Path]]:
+    """Имя навыка → (описание, файл). Описание — первая непустая строка файла."""
+    found = {}
+    if SKILLS_DIR.is_dir():
+        for file in sorted(SKILLS_DIR.glob("*.md")):
+            lines = [line for line in file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            found[file.stem] = (lines[0].lstrip("# ").strip() if lines else "", file)
+    return found
+
+
+class UseSkill(Tool):
+    """Прочитать полный текст навыка — готовой инструкции для определённого вида работы.
+    Список навыков с описаниями дан в системном промпте."""
+
+    name: str = Field(description="Имя навыка из списка")
+
+    def run(self) -> str:
+        found = skills()
+        if self.name not in found:
+            raise ValueError(f"нет навыка {self.name!r}. Доступны: {', '.join(found) or 'ни одного'}")
+        return found[self.name][1].read_text(encoding="utf-8")
+
+
+# ─── ХУКИ ────────────────────────────────────────────────────────────────────
+# Хук — команда пользователя, которую харнесс запускает до или после вызова инструмента.
+# Просьбу в промпте модель может не выполнить, а хук срабатывает всегда: это способ
+# навязать агенту правило. Хуки задаются в hooks.json рядом со скриптом:
+#   [{"when": "after", "tool": "edit_file", "command": "ruff check ."},
+#    {"when": "before", "tool": "run_shell", "command": "python check_command.py"}]
+# Команда получает на вход JSON с именем инструмента, аргументами и (для after) результатом.
+
+HOOKS: list[dict] = []
+
+
+def load_hooks() -> None:
+    if not HOOKS_FILE.exists():
+        return
+    for hook in json.loads(HOOKS_FILE.read_text(encoding="utf-8")):
+        if hook.get("when") not in ("before", "after") or not hook.get("tool") or not hook.get("command"):
+            sys.exit(f"Ошибка в {HOOKS_FILE.name}: {hook!r}. Нужны поля when (before/after), tool и command.")
+        HOOKS.append(hook)
+
+
+def run_hooks(when: str, name: str, raw_args: str, output: str | None = None) -> tuple[bool, str]:
+    """Возвращает (заблокировано, текст для модели).
+
+    Хук «before» с ненулевым кодом выхода отменяет вызов инструмента.
+    Вывод хука «after» дописывается к результату инструмента.
+    """
+    notes = []
+    for hook in HOOKS:
+        if hook["when"] != when or hook["tool"] not in (name, "*"):
+            continue
+        payload = json.dumps({"tool": name, "arguments": json.loads(raw_args or "{}"), "output": output}, ensure_ascii=False)
+        try:
+            done = subprocess.run(
+                hook["command"], shell=True, cwd=WORKSPACE, input=payload, capture_output=True, text=True, timeout=30
+            )
+            text, failed = (done.stdout + done.stderr).strip(), done.returncode != 0
+        except subprocess.TimeoutExpired:
+            text, failed = "хук не уложился в 30 секунд", True
+        if when == "before" and failed:
+            return True, text or "хук завершился с ошибкой"
+        if text:
+            notes.append(text)
+    return False, "\n".join(notes)
+
+
+# ─── MCP: ВНЕШНИЕ ИНСТРУМЕНТЫ ────────────────────────────────────────────────
+# MCP (Model Context Protocol) — открытый протокол, по которому агенты подключают
+# инструменты, написанные кем-то другим: базы данных, GitHub, файловые хранилища.
+# Сервер — отдельная программа. Харнесс запускает её и общается через стандартный
+# ввод и вывод сообщениями JSON-RPC, по одному на строку. Нужны всего три запроса:
+# initialize (знакомство), tools/list (что умеешь) и tools/call (сделай).
+
+MCP_TOOLS: dict[str, tuple["McpServer", str]] = {}  # имя для модели → (сервер, имя инструмента на сервере)
+MCP_SERVERS: list["McpServer"] = []
+
+
+class McpServer:
+    def __init__(self, name: str, command: str, args: list[str], env: dict[str, str]):
+        self.name = name
+        self._proc = subprocess.Popen(
+            [command, *args], cwd=Path(__file__).parent, env={**os.environ, **env}, text=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        self._next_id = 0
+        self._lock = threading.Lock()  # субагенты могут обращаться к серверу одновременно
+        self._inbox: queue.Queue = queue.Queue()
+        threading.Thread(target=self._read, daemon=True).start()
+        client = {"name": "harness", "version": "1.0"}
+        self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": client})
+        self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.tools = self.request("tools/list").get("tools", [])
+
+    def _read(self) -> None:
+        with self._proc.stdout:
+            for line in self._proc.stdout:
+                with contextlib.suppress(json.JSONDecodeError):
+                    self._inbox.put(json.loads(line))
+
+    def _send(self, message: dict) -> None:
+        self._proc.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+        self._proc.stdin.flush()
+
+    def request(self, method: str, params: dict | None = None) -> dict:
+        with self._lock:
+            self._next_id += 1
+            self._send({"jsonrpc": "2.0", "id": self._next_id, "method": method, "params": params or {}})
+            deadline = time.monotonic() + MCP_TIMEOUT
+            while True:
+                try:
+                    message = self._inbox.get(timeout=max(deadline - time.monotonic(), 0.01))
+                except queue.Empty:
+                    raise TimeoutError(f"MCP-сервер {self.name} не ответил за {MCP_TIMEOUT} с")
+                if message.get("id") != self._next_id:
+                    continue  # уведомления и чужие сообщения пропускаем
+                if "error" in message:
+                    raise RuntimeError(f"MCP-сервер {self.name}: {message['error'].get('message')}")
+                return message.get("result", {})
+
+    def call(self, tool: str, arguments: dict) -> str:
+        result = self.request("tools/call", {"name": tool, "arguments": arguments})
+        parts = [part.get("text", f"[{part.get('type')}]") for part in result.get("content", [])]
+        return ("ОШИБКА инструмента: " if result.get("isError") else "") + "\n".join(parts)
+
+    def close(self) -> None:
+        if self._proc.poll() is None:
+            self._proc.stdin.close()  # закрытый ввод — сигнал серверу завершиться
+            self._proc.terminate()
+            self._proc.wait(timeout=5)
+
+
+def load_mcp() -> None:
+    """Запускает серверы из mcp.json и добавляет их инструменты к своим.
+
+    Формат: {"servers": {"имя": {"command": "python", "args": ["server.py"], "env": {}}}}
+    """
+    if not MCP_FILE.exists():
+        return
+    for name, config in json.loads(MCP_FILE.read_text(encoding="utf-8")).get("servers", {}).items():
+        try:
+            server = McpServer(name, config["command"], config.get("args", []), config.get("env", {}))
+        except Exception as error:  # один неисправный сервер не должен мешать запуску
+            print(f"[MCP-сервер {name} не запустился: {type(error).__name__}: {error}]")
+            continue
+        MCP_SERVERS.append(server)
+        for tool in server.tools:
+            full_name = re.sub(r"[^A-Za-z0-9_-]", "_", f"mcp__{name}__{tool['name']}")[:64]
+            MCP_TOOLS[full_name] = (server, tool["name"])
+            schema = {"type": "function", "function": {
+                "name": full_name,
+                "description": tool.get("description", ""),
+                "parameters": tool.get("inputSchema") or {"type": "object", "properties": {}},
+            }}
+            TOOLS.append(schema)  # схему сервер даёт готовую — Pydantic здесь не участвует
+            SUBAGENT_TOOLS.append(schema)
+        print(f"[MCP-сервер {name}: инструментов подключено — {len(server.tools)}]")
+
+
+def close_mcp() -> None:
+    for server in MCP_SERVERS:
+        server.close()
+
+
 # ─── ПАМЯТЬ, СПИСОК ЗАДАЧ, СУБАГЕНТЫ: инструменты, меняющие сам харнесс ──────
 
 class Remember(Tool):
@@ -705,6 +1113,11 @@ REGISTRY: dict[str, type[Tool]] = {
     "browser_click": BrowserClick,
     "browser_type": BrowserType,
     "browser_screenshot": BrowserScreenshot,
+    "web_search": WebSearch,
+    "process_start": ProcessStart,
+    "process_output": ProcessOutput,
+    "process_stop": ProcessStop,
+    "use_skill": UseSkill,
     "remember": Remember,
     "todo": Todo,
     "delegate": Delegate,
@@ -714,6 +1127,7 @@ REGISTRY: dict[str, type[Tool]] = {
 READONLY = {
     "list_dir", "read_file", "search", "find_files", "git_status", "git_diff",
     "browser_open", "browser_read", "browser_screenshot", "todo",
+    "web_search", "use_skill", "process_output",
 }
 
 
@@ -742,11 +1156,12 @@ SUBAGENT_TOOLS = tool_schemas(set(REGISTRY) - {"delegate", "remember", "todo"})
 DEFAULT_PERMISSIONS = {
     "run_shell": "ask",      # произвольная команда на машине
     "run_python": "ask",     # произвольный код на машине
+    "process_start": "ask",  # произвольная команда, которая ещё и остаётся работать
     "git_restore": "ask",    # безвозвратно стирает правки
     "browser_click": "ask",  # может отправить форму или что-то купить
     "browser_type": "ask",   # вводит данные на сайте
 }
-PERMISSIONS = dict(DEFAULT_PERMISSIONS)  # всё, чего здесь нет, разрешено
+PERMISSIONS = dict(DEFAULT_PERMISSIONS)  # всё, чего здесь нет, разрешено; инструменты MCP — спрашивать
 
 
 def load_permissions() -> None:
@@ -754,22 +1169,30 @@ def load_permissions() -> None:
     if not PERMISSIONS_FILE.exists():
         return
     for name, rule in json.loads(PERMISSIONS_FILE.read_text(encoding="utf-8")).items():
-        if name not in REGISTRY or rule not in ("allow", "ask", "deny"):
+        if (name not in REGISTRY and name not in MCP_TOOLS) or rule not in ("allow", "ask", "deny"):
             sys.exit(f"Ошибка в {PERMISSIONS_FILE.name}: {name!r}: {rule!r}. Правила: allow, ask, deny.")
         PERMISSIONS[name] = rule
 
 
-def permit(name: str, call: Tool, label: str) -> str | None:
-    """Возвращает None, если действие разрешено, иначе текст отказа для модели."""
-    rule = PERMISSIONS.get(name, "allow")
+def permit(name: str, describe, label: str) -> str | None:
+    """Возвращает None, если действие разрешено, иначе текст отказа для модели.
+    describe — функция, которая показывает человеку, что именно собираются сделать."""
+    # Чужие инструменты (MCP) по умолчанию требуют разрешения: харнесс не знает, что они делают.
+    rule = PERMISSIONS.get(name, "ask" if name in MCP_TOOLS else "allow")
     if rule == "deny":
         return "ОТКАЗ: этот инструмент запрещён настройками пользователя. Не пытайся вызвать его снова."
     if rule == "allow":
         return None
+    if NONINTERACTIVE:
+        return "ОТКАЗ: харнесс запущен без диалога, спросить разрешение не у кого, а в --allow этого инструмента нет."
     with IO_LOCK:  # субагенты работают параллельно — вопросы человеку задаём по одному
         if name in ALWAYS or CANCEL.is_set():
             return None if name in ALWAYS else "Работа прервана пользователем."
-        print(f"    {label} хочет выполнить: {name} — {call.summary()}")
+        try:
+            details = describe()
+        except Exception:  # например, файл для diff не читается — спросим без подробностей
+            details = "(подробности показать не удалось)"
+        print(f"    {label} хочет выполнить: {name}" + (f"\n{details}" if "\n" in details else f" — {details.strip()}"))
         answer = ask("    разрешить? [y — да / a — всегда в этой сессии / N — нет] ")
     if answer == "a":
         ALWAYS.add(name)
@@ -784,22 +1207,40 @@ def permit(name: str, call: Tool, label: str) -> str | None:
 
 def execute_tool(name: str, raw_args: str, allowed: set[str], label: str = "агент") -> str:
     """Аргументы приходят от модели JSON-строкой. Ошибка не роняет харнесс:
-    она уходит модели обычным текстом, и модель сама решает, как её обойти."""
+    она уходит модели обычным текстом, и модель сама решает, как её обойти.
+
+    Порядок: проверка аргументов → разрешение → хук «до» → действие → хук «после».
+    """
     if name not in allowed:  # модель может назвать инструмент, которого ей не давали
         return f"ОШИБКА: инструмент {name!r} сейчас недоступен. Доступны: {', '.join(sorted(allowed))}"
-    try:
-        call = REGISTRY[name].model_validate_json(raw_args)  # разбор JSON + проверка типов и ограничений
-    except ValidationError as error:
-        # Точно говорим модели, какое поле и чем не устроило, — так ей проще исправиться.
-        problems = [f"{'.'.join(map(str, e['loc'])) or 'аргументы'}: {e['msg']}" for e in error.errors()]
-        return "ОШИБКА в аргументах:\n" + "\n".join(problems)
-    refusal = permit(name, call, label)
+    if name in MCP_TOOLS:  # чужой инструмент: аргументы проверит сам сервер
+        server, tool = MCP_TOOLS[name]
+        try:
+            arguments = json.loads(raw_args or "{}")
+        except json.JSONDecodeError as error:
+            return f"ОШИБКА в аргументах: Invalid JSON: {error}"
+        describe, action = (lambda: one_line(raw_args, 300)), (lambda: server.call(tool, arguments))
+    else:
+        try:
+            call = REGISTRY[name].model_validate_json(raw_args)  # разбор JSON + проверка типов и ограничений
+        except ValidationError as error:
+            # Точно говорим модели, какое поле и чем не устроило, — так ей проще исправиться.
+            problems = [f"{'.'.join(map(str, e['loc'])) or 'аргументы'}: {e['msg']}" for e in error.errors()]
+            return "ОШИБКА в аргументах:\n" + "\n".join(problems)
+        describe, action = call.preview, call.run
+    refusal = permit(name, describe, label)
     if refusal:
         return refusal
+    blocked, note = run_hooks("before", name, raw_args)
+    if blocked:
+        return f"ЗАБЛОКИРОВАНО хуком пользователя: {note}"
     try:
-        output = call.run()
+        output = action()
     except Exception as error:  # KeyboardInterrupt сюда не попадает: Ctrl+C должен дойти до main
         return f"ОШИБКА {type(error).__name__}: {error}"
+    _, note = run_hooks("after", name, raw_args, output)
+    if note:
+        output += f"\n[хук пользователя] {note}"
     # Общий потолок: один неудачный вызов (огромный вывод команды) не должен съесть весь контекст.
     if len(output) > OUTPUT_LIMIT:
         output = output[:OUTPUT_LIMIT] + f"\n[результат обрезан: ещё {len(output) - OUTPUT_LIMIT} символов]"
@@ -815,6 +1256,8 @@ class Context:
 
     messages: list
     prompt_tokens: int = 0  # размер контекста в токенах — по данным последнего ответа API
+    model: str = ""  # пусто — основная модель; у субагентов своя, подешевле
+    effort: str = ""  # глубина рассуждений; пусто — как у основного агента
 
 
 def render(messages: list) -> str:
@@ -852,7 +1295,7 @@ def compact(client, context: Context) -> bool:
         return False
 
     response = client.chat.completions.create(
-        model=MODEL,
+        model=UTILITY_MODEL, reasoning_effort=UTILITY_EFFORT,  # пересказ — простая работа для дешёвой модели
         messages=[{"role": "system", "content": COMPACT_PROMPT}, {"role": "user", "content": render(old)}],
     )
     METER.add(response.usage)
@@ -896,7 +1339,7 @@ def attach_images(messages: list, label: str) -> None:
 
 # ─── 4. ЦИКЛ АГЕНТА ──────────────────────────────────────────────────────────
 
-def stream_reply(client, messages: list, tools: list, label: str | None):
+def stream_reply(client, context: Context, tools: list, label: str | None):
     """ПОТОКОВАЯ ВЫДАЧА: ответ приходит кусочками, и текст печатается сразу, а не после паузы.
 
     Вызовы инструментов тоже приходят по частям: сначала id и имя, потом JSON аргументов
@@ -904,7 +1347,8 @@ def stream_reply(client, messages: list, tools: list, label: str | None):
     Если label не задан, текст не печатается — так работают параллельные субагенты.
     """
     stream = client.chat.completions.create(
-        model=MODEL, tools=tools, messages=messages, stream=True, stream_options={"include_usage": True}
+        model=context.model or MODEL, reasoning_effort=context.effort or EFFORT,
+        tools=tools, messages=context.messages, stream=True, stream_options={"include_usage": True},
     )
     text, calls, finish_reason, usage = "", {}, None, None
     for chunk in stream:
@@ -944,14 +1388,14 @@ def run_turn(client, context: Context, tools: list = TOOLS, label: str = "аге
 
     for step in range(1, MAX_STEPS + 1):
         if CANCEL.is_set():
-            return "Работа прервана пользователем."
+            return f"{STOPPED}: прервано пользователем."
         if METER.over_budget():
             emit(f"\n{prefix}[остановлено: исчерпан бюджет сессии ${METER.budget:g}]")
-            return "Работа остановлена: исчерпан бюджет сессии."
+            return f"{STOPPED}: исчерпан бюджет сессии."
         if context.prompt_tokens > COMPACT_AT_TOKENS:
             compact(client, context)
 
-        text, calls, finish_reason, usage = stream_reply(client, messages, tools, label if live else None)
+        text, calls, finish_reason, usage = stream_reply(client, context, tools, label if live else None)
         METER.add(usage)
         if usage:
             context.prompt_tokens = usage.prompt_tokens
@@ -967,7 +1411,7 @@ def run_turn(client, context: Context, tools: list = TOOLS, label: str = "аге
             ]
         messages.append(entry)
         JOURNAL.write(
-            "model", agent=label, text=text, tool_calls=calls, finish_reason=finish_reason,
+            "model", agent=label, model=context.model or MODEL, text=text, tool_calls=calls, finish_reason=finish_reason,
             prompt_tokens=usage and usage.prompt_tokens, completion_tokens=usage and usage.completion_tokens,
         )
 
@@ -988,7 +1432,7 @@ def run_turn(client, context: Context, tools: list = TOOLS, label: str = "аге
         attach_images(messages, label)
 
     emit(f"\n{prefix}[остановлено: превышен лимит в {MAX_STEPS} шагов]")
-    return f"Работа остановлена: превышен лимит в {MAX_STEPS} шагов."
+    return f"{STOPPED}: превышен лимит в {MAX_STEPS} шагов."
 
 
 # ─── СУБАГЕНТЫ ───────────────────────────────────────────────────────────────
@@ -1004,7 +1448,8 @@ def run_subagents(tasks: list[str]) -> str:
     def work(number: int, task: str) -> str:
         label = f"субагент {number}"
         JOURNAL.write("subagent_start", agent=label, task=task)
-        context = Context([{"role": "system", "content": SUBAGENT_PROMPT}, {"role": "user", "content": task}])
+        messages = [{"role": "system", "content": SUBAGENT_PROMPT}, {"role": "user", "content": task}]
+        context = Context(messages, model=SUBAGENT_MODEL, effort=SUBAGENT_EFFORT)
         try:
             return run_turn(CLIENT, context, SUBAGENT_TOOLS, label, prefix=f"    │ суб{number}: ") or "(нет ответа)"
         except Exception as error:  # сбой одного субагента не должен ронять остальных
@@ -1109,14 +1554,16 @@ def load_env_file() -> None:
                 os.environ.setdefault(key.strip(), value.strip())
 
 
-def handle(context: Context, text: str, tools: list = TOOLS) -> None:
-    """Один запрос пользователя: ход агента, отчёт о расходе и сохранение сессии."""
+def handle(context: Context, text: str, tools: list = TOOLS) -> str | None:
+    """Один запрос пользователя: ход агента, отчёт о расходе и сохранение сессии.
+    Возвращает итоговый текст агента или None, если ход прерван."""
     CANCEL.clear()
+    CHECKPOINTS.append({})  # новая точка отката: /undo вернёт файлы к состоянию на этот момент
     before = METER.totals()
     context.messages.append({"role": "user", "content": text})
     JOURNAL.write("user", text=text)
     try:
-        run_turn(CLIENT, context, tools)
+        return run_turn(CLIENT, context, tools)
     except KeyboardInterrupt:
         # ПРЕРЫВАНИЕ: Ctrl+C останавливает ход, а не программу. Историю чиним и оставляем агенту пометку.
         pending_images().clear()
@@ -1124,6 +1571,7 @@ def handle(context: Context, text: str, tools: list = TOOLS) -> None:
         context.messages.append({"role": "user", "content": "[Пользователь прервал выполнение клавишами Ctrl+C.]"})
         JOURNAL.write("interrupt")
         print("\n[прервано — разговор сохранён, можно продолжать]")
+        return None
     finally:
         report = METER.report(before)
         if report:
@@ -1131,47 +1579,38 @@ def handle(context: Context, text: str, tools: list = TOOLS) -> None:
         save_session(context)
 
 
-def main() -> None:
-    global CLIENT, SESSION_FILE
-    if option("--dir") and not WORKSPACE.is_dir():
-        sys.exit(f"Папка из --dir не найдена: {WORKSPACE}")
-    WORKSPACE.mkdir(exist_ok=True)
-    atexit.register(lambda: browser().close())  # при любом выходе закрываем браузер
-    load_permissions()
-    context = Context([{"role": "system", "content": system_prompt()}])  # живёт, пока запущена программа
+def run_once(context: Context, task: str) -> int:
+    """НЕИНТЕРАКТИВНЫЙ РЕЖИМ: одна задача без диалога — для скриптов, расписаний и CI.
 
-    if "--demo" in sys.argv:
-        print("ДЕМО: ответы модели записаны заранее, инструменты выполняются по-настоящему.")
-        context.messages.append({"role": "user", "content": "Создай файл hello.txt и проверь его."})
-        run_turn(ScriptedClient(), context)
-        return
-
+    Ход агента печатается в stderr, а в stdout попадает только итог (текст или JSON),
+    чтобы его можно было передать другой программе. Код возврата: 0 — задача выполнена.
+    """
     import openai
 
-    load_env_file()
-    if not os.environ.get("XAI_API_KEY"):
-        sys.exit("Не найден ключ: добавьте строку XAI_API_KEY=... в файл .env рядом со скриптом.")
-    CLIENT = openai.OpenAI(api_key=os.environ["XAI_API_KEY"], base_url=BASE_URL)
-    if option("--budget"):
-        METER.budget = float(option("--budget"))
+    result = error = None
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            result = handle(context, task)
+        except openai.APIError as failure:
+            error = f"{type(failure).__name__}: {failure}"
+    ok = bool(result) and not result.startswith(STOPPED)
+    if "--json" in sys.argv:
+        requests, prompt, completion, cost = METER.totals()
+        print(json.dumps({
+            "ok": ok, "result": result, "error": error, "requests": requests, "input_tokens": prompt,
+            "output_tokens": completion, "cost_usd": round(cost, 6), "session_file": str(SESSION_FILE),
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(result or f"[задача не выполнена: {error or 'ход прерван'}]")
+    return 0 if ok else 1
 
-    SESSION_FILE = SESSIONS_DIR / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.json"
-    resumed = load_last_session() if "--resume" in sys.argv else None
-    if resumed:
-        SESSION_FILE, state = resumed
-        context.messages[1:] = state["messages"][1:]  # системный промпт берём свежий: заметки могли измениться
-        TODO[:] = state.get("todo", [])
-        repair_history(context.messages)  # прошлый запуск мог оборваться посреди хода
 
-    JOURNAL.write("session_start", model=MODEL, workspace=str(WORKSPACE), resumed=bool(resumed))
-    print(f"Харнесс запущен. Модель: {MODEL}. Рабочая папка: {WORKSPACE}.")
-    if resumed:
-        print(f"Продолжаю прошлую сессию: сообщений в истории — {len(context.messages) - 1}.")
-    elif "--resume" in sys.argv:
-        print("Сохранённых сессий нет — начинаю новую.")
+def interactive(context: Context) -> None:
+    """Диалог с человеком: читаем строку, выполняем команду или отдаём её агенту."""
+    import openai
+
     print("Выход — пустая строка. Ctrl+C во время работы агента прерывает ход, а не программу.")
-    print("Команды: /plan ЗАДАЧА — сначала план, потом выполнение; /compact — сжать контекст; /cost — расход.")
-
+    print("Команды: /plan ЗАДАЧА — сначала план; /undo — откатить правки хода; /compact — сжать контекст; /cost — расход.")
     while True:
         try:
             user_input = input("\nвы: ").strip()
@@ -1185,6 +1624,15 @@ def main() -> None:
                     print("[сжимать пока нечего: разговор слишком короткий]")
             elif user_input == "/cost":
                 print(METER.report() or "[запросов к модели ещё не было]")
+            elif user_input == "/undo":
+                files = undo()
+                if not files:
+                    print("[откатывать нечего: агент не менял файлы]")
+                    continue
+                print(f"[откат выполнен: {', '.join(files)}]")
+                # Агент должен знать об откате, иначе будет считать, что его правки на месте.
+                context.messages.append({"role": "user", "content": f"[Пользователь откатил правки последнего хода в файлах: {', '.join(files)}.]"})
+                save_session(context)
             elif user_input == "/plan" or user_input.startswith("/plan "):
                 task = user_input[5:].strip()
                 if not task:
@@ -1208,6 +1656,67 @@ def main() -> None:
             print("\n[нет связи с API — проверьте сеть]")
         except KeyboardInterrupt:
             print("\n[отменено]")
+
+
+def main() -> None:
+    global CLIENT, SESSION_FILE, NONINTERACTIVE
+    if option("--dir") and not WORKSPACE.is_dir():
+        sys.exit(f"Папка из --dir не найдена: {WORKSPACE}")
+    if SANDBOX and not shutil.which("sandbox-exec"):
+        sys.exit("Параметр --sandbox работает только на macOS: нужна системная команда sandbox-exec.")
+    WORKSPACE.mkdir(exist_ok=True)
+    atexit.register(lambda: (browser().close(), stop_all_processes(), close_mcp()))  # при любом выходе прибираем за собой
+
+    if "--demo" in sys.argv:
+        print("ДЕМО: ответы модели записаны заранее, инструменты выполняются по-настоящему.")
+        context = Context([{"role": "system", "content": system_prompt()}, {"role": "user", "content": "Создай файл hello.txt и проверь его."}])
+        run_turn(ScriptedClient(), context)
+        return
+
+    import openai
+
+    load_env_file()
+    if not os.environ.get("XAI_API_KEY"):
+        sys.exit("Не найден ключ: добавьте строку XAI_API_KEY=... в файл .env рядом со скриптом.")
+    CLIENT = openai.OpenAI(api_key=os.environ["XAI_API_KEY"], base_url=BASE_URL)
+    if option("--budget"):
+        METER.budget = float(option("--budget"))
+
+    task = option("-p")
+    with contextlib.redirect_stdout(sys.stderr if task else sys.stdout):  # в режиме -p stdout — только для итога
+        # Правила разрешений зависят от режима запуска; файл permissions.json имеет последнее слово.
+        if option("--dir"):  # в настоящем проекте правки файлов показываем человеку перед применением
+            PERMISSIONS.update(write_file="ask", edit_file="ask")
+        if SANDBOX:  # в песочнице скрипт не навредит — можно не спрашивать
+            PERMISSIONS["run_python"] = "allow"
+        load_mcp()
+        load_hooks()
+        load_permissions()
+        for name in filter(None, (option("--allow") or "").split(",")):
+            if name not in REGISTRY and name not in MCP_TOOLS:
+                sys.exit(f"В --allow указан неизвестный инструмент: {name}")
+            PERMISSIONS[name] = "allow"
+        NONINTERACTIVE = bool(task)
+
+        context = Context([{"role": "system", "content": system_prompt()}])  # живёт, пока запущена программа
+        SESSION_FILE = SESSIONS_DIR / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.json"
+        resumed = load_last_session() if "--resume" in sys.argv else None
+        if resumed:
+            SESSION_FILE, state = resumed
+            context.messages[1:] = state["messages"][1:]  # системный промпт берём свежий: заметки могли измениться
+            TODO[:] = state.get("todo", [])
+            repair_history(context.messages)  # прошлый запуск мог оборваться посреди хода
+
+        JOURNAL.write("session_start", model=MODEL, workspace=str(WORKSPACE), resumed=bool(resumed), sandbox=SANDBOX)
+        print(f"Харнесс запущен. Модель: {MODEL}. Рабочая папка: {WORKSPACE}." + (" Песочница включена." if SANDBOX else ""))
+        if resumed:
+            print(f"Продолжаю прошлую сессию: сообщений в истории — {len(context.messages) - 1}.")
+        elif "--resume" in sys.argv:
+            print("Сохранённых сессий нет — начинаю новую.")
+
+    if task:
+        sys.exit(run_once(context, task))
+    interactive(context)
 
 
 if __name__ == "__main__":
