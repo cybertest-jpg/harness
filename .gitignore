@@ -4,3 +4,5 @@ __pycache__/
 .idea/
 logs/
 memory.md
+sessions/
+permissions.json
